@@ -607,10 +607,8 @@ async def notify_staff(report_id, user_id, username, first_name, problem_text):
 
     all_staff = set(ADMINS)
     for h in helpers:
-        all_staff.add(h[0].lower())
-
-    sent_msg_ids = []
-      for staff_username in all_staff:
+        all_staff.add(h[0].lower()
+                      
         chat_id = _chat_id_cache.get(staff_username)
         if chat_id:
             try:
