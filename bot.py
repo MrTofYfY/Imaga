@@ -1,298 +1,3 @@
-  )
-
-    if reply:
-        text += (
-            f"\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"✅ <b>Ответ от</b> @{replied_by}:\n"
-            f"<i>{reply}</i>\n"
-            f"📅 <b>Отвечено:</b> {replied_at}"
-        )
-
-    await callback.message.edit_text(text, reply_markup=report_action_keyboard(rid, status))
-    await callback.answer()
-
-
-# ======================== Reply to Report ========================
-
-@main_router.callback_query(F.data.startswith("reply_report_"))
-async def cb_reply_report(callback: CallbackQuery, state: FSMContext):
-    if not await is_staff(callback.from_user.username):
-        await callback.answer("❌ Нет доступа", show_alert=True)
-        return
-
-    report_id = int(callback.data.split("_")[2])
-
-    await state.set_state(ReplyStates.waiting_for_reply)
-    await state.update_data(report_id=report_id)
-
-    await callback.message.edit_text(
-        f"<b>💬 Ответ на обращение #{report_id}</b>\n\n"
-        "Напишите ваш ответ пользователю в <b>одном сообщении</b>.\n\n"
-        "<i>Отправьте ответ ниже ⬇️</i>",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="❌ Отмена", callback_data="back_to_panel")]
-        ])
-    )
-    await callback.answer()
-
-
-@main_router.message(ReplyStates.waiting_for_reply)
-async def process_reply(message: Message, state: FSMContext):
-    if not await is_staff(message.from_user.username):
-        return
-
-    reply_text = message.text
-    if not reply_text:
-        await message.answer("❌ Отправьте текстовое сообщение.")
-        return
-
-    data = await state.get_data()
-    report_id = data.get("report_id")
-    replied_by = message.from_user.username or "unknown"
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute(
-            "SELECT user_id, username, first_name, message, notify_msg_ids FROM reports WHERE id = ?",
-            (report_id,)
-        )
-        report = await cursor.fetchone()
-
-        if not report:
-            await message.answer("❌ Обращение не найдено.")
-            await state.clear()
-            return
-
-        user_id, uname, fname, original_msg, notify_msg_ids = report
-
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        await db.execute(
-            "UPDATE reports SET status = 'answered', reply = ?, replied_by = ?, replied_at = ? WHERE id = ?",
-            (reply_text, replied_by, now, report_id)
-        )
-        await db.commit()
-
-    await state.clear()
-
-    try:
-        user_notify_text = (
-            f"<b>✅ Ответ на ваше обращение #{report_id}</b>\n\n"
-            f"📝 <b>Ваш вопрос:</b>\n<i>{original_msg}</i>\n\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"💬 <b>Ответ от поддержки:</b>\n<i>{reply_text}</i>\n\n"
-            f"<i>Спасибо за обращение! Если проблема не решена,\n"
-            f"создайте новое обращение.</i>"
-        )
-        await bot.send_message(user_id, user_notify_text, reply_markup=main_menu_keyboard())
-    except Exception as e:
-        logger.error(f"Не удалось уведомить пользователя {user_id}: {e}")
-
-    if notify_msg_ids:
-        for item in notify_msg_ids.split(","):
-            if ":" in item:
-                try:
-                    chat_id, msg_id = item.split(":")
-                    updated_text = (
-                        f"<b>✅ Обращение #{report_id} — ОТВЕЧЕНО</b>\n\n"
-                        f"👤 <b>От:</b> {fname} (@{uname})\n\n"
-                        f"💬 <b>Вопрос:</b>\n<i>{original_msg}</i>\n\n"
-                        f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                        f"✅ <b>Ответ от</b> @{replied_by}:\n<i>{reply_text}</i>"
-                    )
-                    await bot.edit_message_text(
-                        updated_text,
-                        chat_id=int(chat_id),
-                        message_id=int(msg_id),
-                        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                            [InlineKeyboardButton(
-                                text="✏️ Изменить ответ",
-                                callback_data=f"reply_report_{report_id}"
-                            )]
-                        ])
-                    )
-                except Exception as e:
-                    logger.error(f"Failed to update notification: {e}")
-
-    await message.answer(
-        f"<b>✅ Ответ на обращение #{report_id} отправлен!</b>\n\n"
-        f"Пользователь {fname} (@{uname}) уведомлён.",
-        reply_markup=staff_panel_keyboard()
-    )
-
-
-# ======================== Manage Helpers ========================
-
-@main_router.callback_query(F.data == "manage_helpers")
-async def cb_manage_helpers(callback: CallbackQuery):
-    if not await is_admin(callback.from_user.username):
-        await callback.answer("❌ Только администраторы могут управлять помощниками", show_alert=True)
-        return
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute("SELECT username, added_by FROM helpers")
-        helpers = await cursor.fetchall()
-
-    text = "<b>👥 Управление помощниками</b>\n\n"
-
-    if helpers:
-        for h in helpers:
-            uname, added_by = h
-            is_adm = "👑" if uname in ADMINS else "🛡"
-            text += f"{is_adm} @{uname}"
-            if uname not in ADMINS:
-                text += f" (добавил: @{added_by})"
-            else:
-                text += " (Администратор)"
-            text += "\n"
-    else:
-        text += "Нет помощников.\n"
-
-    buttons = [
-        [InlineKeyboardButton(text="➕ Добавить помощника", callback_data="add_helper")],
-    ]
-
-    for h in helpers:
-        if h[0] not in ADMINS:
-            buttons.append([
-                InlineKeyboardButton(
-                    text=f"❌ Удалить @{h[0]}",
-                    callback_data=f"remove_helper_{h[0]}"
-                )
-            ])
-
-    buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_panel")])
-    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
-
-    await callback.message.edit_text(text, reply_markup=kb)
-    await callback.answer()
-
-
-@main_router.callback_query(F.data == "add_helper")
-async def cb_add_helper(callback: CallbackQuery, state: FSMContext):
-    if not await is_admin(callback.from_user.username):
-        await callback.answer("❌ Нет доступа", show_alert=True)
-        return
-
-    await state.set_state(AddHelperStates.waiting_for_username)
-    await callback.message.edit_text(
-        "<b>➕ Добавление помощника</b>\n\n"
-        "Введите <b>username</b> нового помощника (без @).\n\n"
-        "<i>Отправьте username ниже ⬇️</i>",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="❌ Отмена", callback_data="manage_helpers")]
-        ])
-    )
-    await callback.answer()
-
-
-@main_router.message(AddHelperStates.waiting_for_username)
-async def process_add_helper(message: Message, state: FSMContext):
-    if not await is_admin(message.from_user.username):
-        return
-
-    username = message.text.strip().replace("@", "").lower()
-
-    if not username:
-        await message.answer("❌ Введите корректный username.")
-        return
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        try:
-            await db.execute(
-                "INSERT INTO helpers (username, added_by) VALUES (?, ?)",
-                (username, message.from_user.username)
-            )
-            await db.commit()
-            await state.clear()
-            await message.answer(
-                f"<b>✅ Помощник @{username} добавлен!</b>",
-                reply_markup=staff_panel_keyboard()
-            )
-        except aiosqlite.IntegrityError:
-            await message.answer(
-                f"❌ @{username} уже является помощником.",
-                reply_markup=staff_panel_keyboard()
-            )
-            await state.clear()
-
-
-@main_router.callback_query(F.data.startswith("remove_helper_"))
-async def cb_remove_helper(callback: CallbackQuery):
-    if not await is_admin(callback.from_user.username):
-        await callback.answer("❌ Нет доступа", show_alert=True)
-        return
-
-    username = callback.data.replace("remove_helper_", "")
-
-    if username in ADMINS:
-        await callback.answer("❌ Нельзя удалить администратора", show_alert=True)
-        return
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("DELETE FROM helpers WHERE username = ?", (username,))
-        await db.commit()
-
-    await callback.answer(f"✅ @{username} удалён из помощников", show_alert=True)
-
-    await cb_manage_helpers(callback)
-
-
-# ======================== Scheduled: Cleanup old answered reports ========================
-
-async def cleanup_old_reports():
-    """Удаляет отвеченные репорты старше 1 дня"""
-    threshold = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S")
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute(
-            "SELECT id, notify_msg_ids FROM reports WHERE status = 'answered' AND replied_at <= ?",
-            (threshold,)
-        )
-        old_reports = await cursor.fetchall()
-
-        for report in old_reports:
-            rid, notify_msg_ids = report
-            if notify_msg_ids:
-                for item in notify_msg_ids.split(","):
-                    if ":" in item:
-                        try:
-                            chat_id, msg_id = item.split(":")
-                            await bot.delete_message(int(chat_id), int(msg_id))
-                        except Exception:
-                            pass
-
-            logger.info(f"Cleanup: removing answered report #{rid}")
-
-        await db.execute(
-            "DELETE FROM reports WHERE status = 'answered' AND replied_at <= ?",
-            (threshold,)
-        )
-        await db.commit()
-
-
-# ======================== Main ========================
-
-async def on_startup():
-    await init_db()
-    await bot.set_my_commands([
-        BotCommand(command="start", description="🏠 Главное меню"),
-        BotCommand(command="panel", description="🔧 Панель поддержки (для персонала)"),
-    ])
-
-    scheduler.add_job(cleanup_old_reports, "interval", hours=1)
-    scheduler.start()
-
-    logger.info("Bot started!")
-    logger.info(f"Admins: {ADMINS}")
-    logger.info(f"Server: {SERVER_IP}")
-
-
-async def main():
-    await on_startup()
-    await dp.start_polling(bot)
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
 import os
 import asyncio
 import logging
@@ -693,9 +398,7 @@ async def cb_my_reports(callback: CallbackQuery):
 
     await callback.message.edit_text(text, reply_markup=support_menu_keyboard())
     await callback.answer()
-
-
-# ======================== Staff Handlers ========================
+  # ======================== Staff Handlers ========================
 
 @router.callback_query(F.data == "staff_open_reports")
 async def cb_staff_open_reports(callback: CallbackQuery):
@@ -705,7 +408,8 @@ async def cb_staff_open_reports(callback: CallbackQuery):
 
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
-            "SELECT id, user_id, username, first_name, message FROM reports WHERE status = 'open' ORDER BY id DESC"
+            "SELECT id, user_id, username, first_name, message "
+            "FROM reports WHERE status = 'open' ORDER BY id DESC"
         )
         reports = await cursor.fetchall()
 
@@ -794,6 +498,8 @@ async def cb_back_to_panel(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
+# ======================== View Report ========================
+
 @router.callback_query(F.data.startswith("view_report_"))
 async def cb_view_report(callback: CallbackQuery):
     if not await is_staff(callback.from_user.username):
@@ -838,6 +544,8 @@ async def cb_view_report(callback: CallbackQuery):
     await callback.answer()
 
 
+# ======================== Reply to Report ========================
+
 @router.callback_query(F.data.startswith("reply_report_"))
 async def cb_reply_report(callback: CallbackQuery, state: FSMContext):
     if not await is_staff(callback.from_user.username):
@@ -866,7 +574,7 @@ async def process_reply(message: Message, state: FSMContext):
 
     reply_text = message.text
     if not reply_text:
-                await message.answer("❌ Отправьте текстовое сообщение.")
+        await message.answer("❌ Отправьте текстовое сообщение.")
         return
 
     data = await state.get_data()
@@ -898,6 +606,7 @@ async def process_reply(message: Message, state: FSMContext):
 
     await state.clear()
 
+    # Уведомляем пользователя
     try:
         user_notify_text = (
             f"<b>✅ Ответ на ваше обращение #{report_id}</b>\n\n"
@@ -913,6 +622,7 @@ async def process_reply(message: Message, state: FSMContext):
     except Exception as e:
         logger.error(f"Не удалось уведомить пользователя {user_id}: {e}")
 
+    # Обновляем уведомления у персонала
     if notify_msg_ids:
         for item in notify_msg_ids.split(","):
             if ":" in item:
@@ -977,9 +687,7 @@ async def cb_manage_helpers(callback: CallbackQuery):
         text += "Нет помощников.\n"
 
     buttons = [
-        [InlineKeyboardButton(
-            text="➕ Добавить помощника", callback_data="add_helper"
-        )],
+        [InlineKeyboardButton(text="➕ Добавить помощника", callback_data="add_helper")],
     ]
     for h in helpers:
         if h[0] not in ADMINS:
@@ -1009,9 +717,7 @@ async def cb_add_helper(callback: CallbackQuery, state: FSMContext):
         "Введите <b>username</b> нового помощника (без @).\n\n"
         "<i>Отправьте username ниже ⬇️</i>",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(
-                text="❌ Отмена", callback_data="manage_helpers"
-            )]
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="manage_helpers")]
         ])
     )
     await callback.answer()
@@ -1056,20 +762,14 @@ async def cb_remove_helper(callback: CallbackQuery):
     username = callback.data.replace("remove_helper_", "")
 
     if username in ADMINS:
-        await callback.answer(
-            "❌ Нельзя удалить администратора", show_alert=True
-        )
+        await callback.answer("❌ Нельзя удалить администратора", show_alert=True)
         return
 
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "DELETE FROM helpers WHERE username = ?", (username,)
-        )
+        await db.execute("DELETE FROM helpers WHERE username = ?", (username,))
         await db.commit()
 
-    await callback.answer(
-        f"✅ @{username} удалён из помощников", show_alert=True
-    )
+    await callback.answer(f"✅ @{username} удалён из помощников", show_alert=True)
     await cb_manage_helpers(callback)
 
 
@@ -1077,9 +777,7 @@ async def cb_remove_helper(callback: CallbackQuery):
 
 async def cleanup_old_reports():
     """Удаляет отвеченные репорты старше 1 дня"""
-    threshold = (
-        datetime.now() - timedelta(days=1)
-    ).strftime("%Y-%m-%d %H:%M:%S")
+    threshold = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S")
 
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
@@ -1096,16 +794,13 @@ async def cleanup_old_reports():
                     if ":" in item:
                         try:
                             chat_id, msg_id = item.split(":")
-                            await bot.delete_message(
-                                int(chat_id), int(msg_id)
-                            )
+                            await bot.delete_message(int(chat_id), int(msg_id))
                         except Exception:
                             pass
             logger.info(f"Cleanup: removing answered report #{rid}")
 
         await db.execute(
-            "DELETE FROM reports "
-            "WHERE status = 'answered' AND replied_at <= ?",
+            "DELETE FROM reports WHERE status = 'answered' AND replied_at <= ?",
             (threshold,)
         )
         await db.commit()
@@ -1117,10 +812,7 @@ async def on_startup():
     await init_db()
     await bot.set_my_commands([
         BotCommand(command="start", description="🏠 Главное меню"),
-        BotCommand(
-            command="panel",
-            description="🔧 Панель поддержки (для персонала)"
-        ),
+        BotCommand(command="panel", description="🔧 Панель поддержки (для персонала)"),
     ])
     scheduler.add_job(cleanup_old_reports, "interval", hours=1)
     scheduler.start()
